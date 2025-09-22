@@ -1,4 +1,4 @@
-// server.js — TL Quotes Relay (pure market data SSE)
+// server.js — TL Quotes Relay (market quotes SSE with symbol subscription)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -17,12 +17,17 @@ const PORT   = Number(process.env.PORT || 8080);
 const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 1000);
 const STALE_MS     = Number(process.env.STALE_MS || 120000);
 const READ_TOKEN   = process.env.READ_TOKEN || ''; // optional
+const QUOTE_SYMBOLS_ENV = process.env.QUOTE_SYMBOLS || ''; // e.g. "BTCUSD,EURUSD,XAUUSD"
 
 if (!KEY) { console.error('Missing TL_BRAND_KEY'); process.exit(1); }
 
 // ----- State -----
 const quotes = new Map(); // symbol -> { bid, ask, last, time }
 const subs   = new Set(); // { res, filter:Set<string>, ping }
+const trackedSymbols = new Set(
+  QUOTE_SYMBOLS_ENV.split(',').map(s => s.trim()).filter(Boolean)
+);
+
 let lastBrandEventAt = 0;
 let lastConnectError = '';
 
@@ -52,8 +57,7 @@ function checkToken(req, res){
 }
 function pushQuote(symbol){
   const q = quotes.get(symbol); if (!q) return;
-  const line = `event: quotes\ndata: ${JSON.stringify({ serverTime: Date.now(), symbol, quote: q 
-})}\n\n`;
+  const line = `event: quotes\ndata: ${JSON.stringify({ serverTime: Date.now(), symbol, quote: q })}\n\n`;
   for (const sub of subs){
     if (sub.filter.size && !sub.filter.has(symbol)) continue;
     sub.res.write(line);
@@ -105,21 +109,37 @@ const socket = io(SERVER + '/brand-socket', {
   forceNew: true,
 });
 
-socket.on('connect', () => { console.log('[BrandSocket] connected', socket.id); lastConnectError 
-= ''; });
+function subscribeSymbols(reason = 'manual'){
+  const symbols = Array.from(trackedSymbols);
+  console.log('[Quotes] subscribeSymbols', { reason, count: symbols.length, symbols });
+  if (!socket.connected || symbols.length === 0) return;
+
+  // Fire a few common subscription events (TradeLocker brand variations).
+  try { socket.emit('subscribe',        { type: 'quotes', symbols }); } catch {}
+  try { socket.emit('quotes:subscribe', { symbols }); } catch {}
+  try { socket.emit('market:subscribe', { symbols }); } catch {}
+}
+
+socket.on('connect', () => {
+  console.log('[BrandSocket] connected', socket.id);
+  lastConnectError = '';
+  subscribeSymbols('connect');
+});
+socket.on('reconnect', (n) => {
+  console.log('[BrandSocket] reconnected', n);
+  subscribeSymbols('reconnect');
+});
 socket.on('disconnect', r => console.warn('[BrandSocket] disconnected', r));
 socket.on('connect_error', (err) => {
   lastConnectError = (err && (err.message || String(err))) || 'connect_error';
-  console.error('[BrandSocket] connect_error', lastConnectError, { description: err?.description, 
-context: err?.context, data: err?.data });
+  console.error('[BrandSocket] connect_error', lastConnectError, { description: err?.description, context: err?.context, data: err?.data });
 });
 socket.on('error', e => console.error('[BrandSocket] error', e));
 
 socket.on('stream', (m) => {
   lastBrandEventAt = Date.now();
   const t = (m?.type || '').toString().toUpperCase();
-  if (t.includes('QUOTE') || t.includes('TICK') || t.includes('PRIC') || t.includes('MARKET') || 
-m?.quote || m?.data?.quote || m?.payload?.quote){
+  if (t.includes('QUOTE') || t.includes('TICK') || t.includes('PRIC') || t.includes('MARKET') || m?.quote || m?.data?.quote || m?.payload?.quote){
     processQuoteLikeEvent(m);
   }
 });
@@ -160,6 +180,22 @@ app.get('/quotes/stream', (req, res) => {
   req.on('close', () => { clearInterval(sub.ping); subs.delete(sub); });
 });
 
+// Manage tracked symbols (runtime)
+app.get('/quotes/tracked', (req, res) => {
+  if (!checkToken(req, res)) return;
+  res.json({ ok:true, count: trackedSymbols.size, symbols: Array.from(trackedSymbols) });
+});
+
+app.post('/quotes/track', (req, res) => {
+  if (!checkToken(req, res)) return;
+  const arr = Array.isArray(req.body?.symbols) ? req.body.symbols : [];
+  const next = new Set(arr.map(String).map(s => s.trim()).filter(Boolean));
+  trackedSymbols.clear();
+  for (const s of next) trackedSymbols.add(s);
+  subscribeSymbols('track');
+  res.json({ ok:true, count: trackedSymbols.size, symbols: Array.from(trackedSymbols) });
+});
+
 // JSON snapshot
 app.get('/quotes/state', (req, res) => {
   if (!checkToken(req, res)) return;
@@ -180,8 +216,6 @@ app.get('/brand/status', (_req,res)=> res.json({
 }));
 
 process.on('unhandledRejection', (r)=>console.error('[unhandledRejection]', r));
-process.on('uncaughtException', (e)=>{ console.error('[uncaughtException]', e); process.exit(1); 
-});
+process.on('uncaughtException', (e)=>{ console.error('[uncaughtException]', e); process.exit(1); });
 
 app.listen(PORT, ()=> console.log(`Quotes relay listening on :${PORT}`));
-
